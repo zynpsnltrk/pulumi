@@ -583,6 +583,40 @@ func (b *cloudBackend) PreviewThenPrompt(
 			return c, false, err
 		}
 
+		// If we're persisteing the results of a simple preview, do so now.
+		if updateKind == client.UpdateKindPreview && opts.PersistPreview {
+			// Get the stack ID
+			stackID, putErr := b.getCloudStackIdentifier(stack.Name())
+			if putErr != nil {
+				err = multierror.Append(err, putErr)
+				return false, err
+			}
+
+			// Render events down
+			seen := make(map[resource.URN]engine.StepEventMetadata)
+			previewEvents := make([]apitype.PreviewEvent, 0, len(events))
+			for _, event := range events {
+				if rendered, has := renderEvent(event, seen, opts.Display); has {
+					previewEvents = append(previewEvents, rendered)
+				}
+			}
+
+			// Store results
+			id, putErr := b.client.PutPreviewResults(ctx, stackID, err == nil, m.Environment, previewEvents)
+			if putErr != nil {
+				err = multierror.Append(err, putErr)
+				return false, err
+			}
+
+			// Print a URL to the preview results.
+			base := b.cloudConsoleStackPath(stackID)
+			if link := b.CloudConsoleURL(base, "previews", id); link != "" {
+				fmt.Printf(colors.ColorizeText(colors.BrightMagenta+"Link: %s"+colors.Reset+"\n"), link)
+			} else {
+				fmt.Printf(colors.ColorizeText(colors.BrightMagenta+"Preview ID: %s"+colors.Reset+"\n"), id)
+			}
+		}
+
 		// TODO(ellismg)[pulumi/pulumi#1347]: Work around 1347 by forcing a choice when running a preview against a PPC
 		changes, hasChanges = c, c.HasChanges() || !stack.(Stack).RunLocally()
 	}

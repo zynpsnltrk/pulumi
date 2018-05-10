@@ -578,3 +578,20 @@ func (pc *Client) AppendUpdateLogEntry(ctx context.Context, update UpdateIdentif
 	return pc.updateRESTCall(ctx, "POST", getUpdatePath(update, "log"), nil, req, nil,
 		updateAccessToken(token), httpCallOptions{RetryAllMethods: true})
 }
+
+// PutPreviewResults uploads a set of preview results to the service.
+func (pc *Client) PutPreviewResults(ctx context.Context, stack StackIdentifier, succeeded bool,
+	environment map[string]string, results []apitype.PreviewEvent) (string, error) {
+
+	req := apitype.PutPreviewResultsRequest{
+		Succeeded:   succeeded,
+		Environment: environment,
+		Results:     results,
+	}
+	var resp apitype.PutPreviewResultsResponse
+	if err := pc.restCall(ctx, "POST", getStackPath(stack, "preview", "results"), nil, req, &resp); err != nil {
+		return "", err
+	}
+
+	return resp.ID, nil
+}

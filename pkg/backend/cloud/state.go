@@ -124,15 +124,7 @@ func (u *cloudUpdate) Complete(status apitype.UpdateStatus) error {
 	return u.backend.client.CompleteUpdate(u.context, u.update, status, token)
 }
 
-func (u *cloudUpdate) recordEvent(
-	event engine.Event, seen map[resource.URN]engine.StepEventMetadata,
-	opts backend.DisplayOptions) error {
-
-	// If we don't have a token source, we can't perform any mutations.
-	if u.tokenSource == nil {
-		return nil
-	}
-
+func renderEvent(event engine.Event, seen map[resource.URN]engine.StepEventMetadata, opts backend.DisplayOptions) (apitype.PreviewEvent, bool) {
 	kind := string(apitype.StdoutEvent)
 	if event.Type == engine.DiagEvent {
 		payload := event.Payload.(engine.DiagEventPayload)
@@ -146,6 +138,26 @@ func (u *cloudUpdate) recordEvent(
 	opts.Color = colors.Raw
 	msg := local.RenderDiffEvent(event, seen, opts)
 	if msg == "" {
+		return apitype.PreviewEvent{}, false
+	}
+
+	return apitype.PreviewEvent{
+		Kind:   kind,
+		Fields: map[string]interface{}{"text": msg, "colorize": colors.Always},
+	}, true
+}
+
+func (u *cloudUpdate) recordEvent(
+	event engine.Event, seen map[resource.URN]engine.StepEventMetadata,
+	opts backend.DisplayOptions) error {
+
+	// If we don't have a token source, we can't perform any mutations.
+	if u.tokenSource == nil {
+		return nil
+	}
+
+	rendered, has := renderEvent(event, seen, opts)
+	if !has {
 		return nil
 	}
 
@@ -154,8 +166,7 @@ func (u *cloudUpdate) recordEvent(
 		return err
 	}
 
-	fields := map[string]interface{}{"text": msg, "colorize": colors.Always}
-	return u.backend.client.AppendUpdateLogEntry(u.context, u.update, kind, fields, token)
+	return u.backend.client.AppendUpdateLogEntry(u.context, u.update, rendered.Kind, rendered.Fields, token)
 }
 
 func (u *cloudUpdate) RecordAndDisplayEvents(action string,

@@ -98,6 +98,8 @@ type UpdateOptions struct {
 	// Display contains all of the backend display options.
 	Display DisplayOptions
 
+	// PersistPreview, when true, will persist a preview.
+	PersistPreview bool
 	// AutoApprove, when true, will automatically approve previews.
 	AutoApprove bool
 	// SkipPreview, when true, causes the preview step to be skipped.
