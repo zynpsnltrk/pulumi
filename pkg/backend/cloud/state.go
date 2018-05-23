@@ -124,7 +124,9 @@ func (u *cloudUpdate) Complete(status apitype.UpdateStatus) error {
 	return u.backend.client.CompleteUpdate(u.context, u.update, status, token)
 }
 
-func renderEvent(event engine.Event, seen map[resource.URN]engine.StepEventMetadata, opts backend.DisplayOptions) (apitype.PreviewEvent, bool) {
+func renderEvent(event engine.Event, seen map[resource.URN]engine.StepEventMetadata,
+	opts backend.DisplayOptions) (apitype.PreviewEvent, bool) {
+
 	kind := string(apitype.StdoutEvent)
 	if event.Type == engine.DiagEvent {
 		payload := event.Payload.(engine.DiagEventPayload)

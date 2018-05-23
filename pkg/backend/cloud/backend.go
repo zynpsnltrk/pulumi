@@ -577,19 +577,18 @@ func (b *cloudBackend) PreviewThenPrompt(
 	// Perform the update operations, passing true for dryRun, so that we get a preview.
 	changes, hasChanges := engine.ResourceChanges(nil), true
 	if !opts.SkipPreview {
-		c, err := b.updateStack(
+		c, previewErr := b.updateStack(
 			ctx, updateKind, stack, pkg, root, m, opts, eventsChannel, true /*dryRun*/, scopes)
-		if err != nil {
-			return c, false, err
-		}
 
-		// If we're persisteing the results of a simple preview, do so now.
-		if updateKind == client.UpdateKindPreview && opts.PersistPreview {
+		// If we're persisting preview results, do so now.
+		if opts.PersistPreview {
 			// Get the stack ID
-			stackID, putErr := b.getCloudStackIdentifier(stack.Name())
-			if putErr != nil {
-				err = multierror.Append(err, putErr)
-				return false, err
+			stackID, err := b.getCloudStackIdentifier(stack.Name())
+			if err != nil {
+				if previewErr == nil {
+					return c, false, err
+				}
+				return c, false, multierror.Append(previewErr, err)
 			}
 
 			// Render events down
@@ -602,10 +601,12 @@ func (b *cloudBackend) PreviewThenPrompt(
 			}
 
 			// Store results
-			id, putErr := b.client.PutPreviewResults(ctx, stackID, err == nil, m.Environment, previewEvents)
-			if putErr != nil {
-				err = multierror.Append(err, putErr)
-				return false, err
+			id, err := b.client.PutPreviewResults(ctx, stackID, previewErr == nil, m.Environment, previewEvents)
+			if err != nil {
+				if previewErr == nil {
+					return c, false, err
+				}
+				return c, false, multierror.Append(previewErr, err)
 			}
 
 			// Print a URL to the preview results.
@@ -615,6 +616,10 @@ func (b *cloudBackend) PreviewThenPrompt(
 			} else {
 				fmt.Printf(colors.ColorizeText(colors.BrightMagenta+"Preview ID: %s"+colors.Reset+"\n"), id)
 			}
+		}
+
+		if previewErr != nil {
+			return c, false, previewErr
 		}
 
 		// TODO(ellismg)[pulumi/pulumi#1347]: Work around 1347 by forcing a choice when running a preview against a PPC

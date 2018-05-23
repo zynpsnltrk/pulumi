@@ -15,24 +15,9 @@ type PutPreviewResultsResponse struct {
 	ID string `json:"id"`
 }
 
-// PreviewState describes the state of a preview.
-type PreviewState string
-
-const (
-	// PreviewStateAwaitingReview indicates that the preview is awaiting review.
-	PreviewStateAwaitingReview = "waiting"
-
-	// PreviewStateApproved indicates that the preview has been approved.
-	PreviewStateApproved = "approved"
-
-	// PreviewStateRejected indicates that the preview has been rejected.
-	PreviewStateRejected = "rejected"
-)
-
 // GetPreviewResultsResponse describes the format of a response to GET preview/results/{previewID}
 type GetPreviewResultsResponse struct {
 	ID        string         `json:"id"`
 	Succeeded bool           `json:"succeeded"`
-	State     PreviewState   `json:"state"`
 	Results   []PreviewEvent `json:"results"`
 }

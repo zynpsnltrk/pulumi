@@ -27,8 +27,6 @@ func newPreviewCmd() *cobra.Command {
 	var showReplacementSteps bool
 	var showSames bool
 
-	var enableWorkflow bool
-
 	var cmd = &cobra.Command{
 		Use:        "preview",
 		Aliases:    []string{"pre"},
@@ -77,7 +75,6 @@ func newPreviewCmd() *cobra.Command {
 					DiffDisplay:          diffDisplay,
 					Debug:                debug,
 				},
-				PersistPreview: enableWorkflow,
 			}
 			changes, err := s.Preview(commandContext(), proj, root, m, opts, cancellationScopes)
 			switch {
@@ -128,10 +125,6 @@ func newPreviewCmd() *cobra.Command {
 	cmd.PersistentFlags().BoolVar(
 		&showSames, "show-sames", false,
 		"Show resources that needn't be updated because they haven't changed, alongside those that do")
-
-	cmd.PersistentFlags().BoolVar(
-		&enableWorkflow, "workflow", false,
-		"Start an update workflow with this preview")
 
 	return cmd
 }
