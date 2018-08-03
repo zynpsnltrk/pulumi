@@ -16,211 +16,292 @@ package deploy
 
 import (
 	"context"
-	"sync/atomic"
+	"sync"
 
+	"github.com/hashicorp/go-multierror"
 	"github.com/pkg/errors"
-	"github.com/pulumi/pulumi/pkg/util/cancel"
+
+	"github.com/pulumi/pulumi/pkg/resource"
+	"github.com/pulumi/pulumi/pkg/util/contract"
 	"github.com/pulumi/pulumi/pkg/util/logging"
 )
 
-const (
-	// Utility constant for easy debugging.
-	planExecutorLogLevel = 4
-)
+// planExecutor is a bag of state used to coordinate during the execution of a plan.
+type planExecutor struct {
+	context context.Context // The context used to cancel plan execution.
 
-var (
-	// ErrPreviewFailed is returned whenever a preview fails.
-	ErrPreviewFailed = errors.New("preview failed")
+	preview bool   // True if this plan is a preview.
+	events  Events // An optional event reporter.
 
-	// ErrUpdateFailed is returned whenever an update fails.
-	ErrUpdateFailed = errors.New("update failed")
-
-	// ErrCanceled is returned whenever a plan is canceled.
-	ErrCanceled = errors.New("plan canceled")
-)
-
-// PlanExecutor is responsible for taking a plan and driving it to completion.
-// Its primary responsibility is to own a `stepGenerator` and `stepExecutor`, serving
-// as the glue that links the two subsystems together.
-type PlanExecutor struct {
-	plan    *Plan          // The plan that we are executing
-	opts    Options        // Options for the plan execution
-	src     SourceIterator // The iterator that generates SourceEvents
-	preview bool           // are we running a preview?
-
-	stepGen  *stepGenerator // step generator owned by this plan
-	stepExec *stepExecutor  // step executor owned by this plan
-
-	ctx            *cancel.Context // Ctrl-C cancellation context, given to us by our caller.
-	stepExecCancel *cancel.Source  // step executor cancellation context, shared ownership between step executor and us.
-
-	sawError  atomic.Value // have we seen an error?
-	sawCancel atomic.Value // have we seen a cancel?
+	pendingNews *sync.Map // The set of resources awaiting outputs.
 }
 
-// Execute executes a plan to completion, using the given cancellation context and running a preview
-// or update.
-func (pe *PlanExecutor) Execute() error {
-	// Before heading into the main event loop, we launch two goroutines. The first one links
-	// the parent cancellation context (which signals cancellation from the CLI level, i.e. Ctrl+C)
-	// to the cancellation context that the plan executor shares with its step executor. This ensures
-	// that top-level cancellations result in quick teardown of all worker threads and the plan executor
-	// itself.
-	go func() {
-		<-pe.ctx.Canceled()
-		logging.V(planExecutorLogLevel).Infof("PlanExecutor.Execute(...): received cancel signal")
-		pe.sawCancel.Store(true)
-		pe.stepExecCancel.Cancel()
-	}()
+// apply applies a single step during plan execution.
+func (w *planExecutor) apply(step Step) (resource.Status, error) {
+	urn := step.URN()
 
-	// The second one polls for incoming source events and writes them to the `incomingEvents` channel,
-	// so the man loop can `select` on it.
-	type nextEvent struct {
-		Event SourceEvent
-		Error error
+	// If there is a pre-event, raise it.
+	var eventctx interface{}
+	if w.events != nil {
+		var eventerr error
+		eventctx, eventerr = w.events.OnResourceStepPre(step)
+		if eventerr != nil {
+			return resource.StatusOK, errors.Wrapf(eventerr, "pre-step event returned an error")
+		}
 	}
 
-	incomingEvents := make(chan nextEvent)
-	go func() {
-		for {
-			event, sourceErr := pe.src.Next()
-			incomingEvents <- nextEvent{event, sourceErr}
-		}
-	}()
+	// Apply the step.
+	logging.V(9).Infof("Applying step %v on %v (preview %v)", step.Op(), urn, w.preview)
+	status, err := step.Apply(w.preview)
+	logging.V(9).Infof("Applied step %v on %v (preview %v): %v", step.Op(), urn, w.preview, err)
 
-	// The main loop. We'll continuously select for incoming events and the cancellation signal. There are
-	// a three ways we can exit this loop:
-	//  1. The SourceIterator sends us a `nil` event. This means that we're done processing source events and
-	//     we should begin processing deletes.
-	//  2. The SourceIterator sends us an error. This means some error occurred in the source program and we
-	//     should bail.
-	//  3. The stepExecCancel cancel context gets canceled. This means some error occurred in the step executor
-	//     and we need to bail. This can also happen if the user hits Ctrl-C.
-outer:
+	// If there is no error, proceed to save the state; otherwise, go straight to the exit codepath.
+	if err == nil {
+		// If we have a state object, and this is a create or update, remember it, as we may need to update it later.
+		if step.Logical() && step.New() != nil {
+			if prior, has := w.pendingNews.Load(urn); has {
+				return resource.StatusOK,
+					errors.Errorf("resource '%s' registered twice (%s and %s)", urn, prior.(Step).Op(), step.Op())
+			}
+
+			w.pendingNews.Store(urn, step)
+		}
+	}
+
+	// If there is a post-event, raise it, and in any case, return the results.
+	if w.events != nil {
+		if eventerr := w.events.OnResourceStepPost(eventctx, step, status, err); eventerr != nil {
+			return status, errors.Wrapf(eventerr, "post-step event returned an error")
+		}
+	}
+
+	return status, err
+}
+
+// canceled returns true if this plan has been canceled.
+func (ex *planExecutor) canceled() bool {
+	return ex.context.Err() != nil
+}
+
+// worker is the function executed by each of a plan executor's worker goroutines in order to process step chains off
+// the given channel.
+func (ex *planExecutor) worker(id int, chains <-chan []Step) error {
 	for {
-		logging.V(planExecutorLogLevel).Infof("PlanExecutor.Execute(...): waiting for incoming events")
 		select {
-		case event := <-incomingEvents:
-			logging.V(planExecutorLogLevel).Infof("PlanExecutor.Execute(...): incoming event")
-			if event.Error != nil {
-				logging.V(planExecutorLogLevel).Infof("PlanExecutor.Execute(...): saw incoming error: %v", event.Error)
-				pe.cancelDueToError()
-				break outer
+		case chain, ok := <-chains:
+			// If the channel is closed, there is no more work to do. Return now.
+			if !ok {
+				return nil
 			}
+			// Otherwise, loop over each step in the chain and apply each in turn after checking for cancellation.
+			for _, s := range chain {
+				if ex.canceled() {
+					return nil
+				}
 
-			if event.Event == nil {
-				logging.V(planExecutorLogLevel).Infof("PlanExecutor.Execute(...): saw nil event, beginning termination")
-
-				// TODO[pulumi/pulumi#1625] Today we lack the ability to parallelize deletions. We have all the
-				// information we need to do so (namely, a dependency graph). `GenerateDeletes` returns a single
-				// chain of every delete that needs to be executed.
-				deletes := pe.stepGen.GenerateDeletes()
-				pe.stepExec.Execute(deletes)
-
-				// Signal completion to the step executor. It'll exit once it's done retiring all of the steps in
-				// the chain that we just gave it.
-				pe.stepExec.SignalCompletion()
-				logging.V(planExecutorLogLevel).Infof("PlanExecutor.Execute(...): completed deletes, exiting loop")
-				break outer
+				logging.V(7).Infof("worker[%v].step(%v, %v)", id, s.Op(), s.URN())
+				_, err := ex.apply(s)
+				if err != nil {
+					return err
+				}
 			}
+		case <-ex.context.Done():
+			// If the execution was cancelled, just return.
+			return nil
+		}
+	}
+}
 
-			pe.handleSingleEvent(event.Event)
-		case <-pe.stepExecCancel.Context().Canceled():
-			logging.V(planExecutorLogLevel).Infof("PlanExecutor.Execute(...): context canceled")
-			pe.cancelDueToError()
-			break outer
+// registerResourceOutputs processes a single RegisterResourceOutputsEvent
+func (ex *planExecutor) registerResourceOutputs(e RegisterResourceOutputsEvent) error {
+	// Look up the final state in the pending registration list.
+	urn := e.URN()
+	step, has := ex.pendingNews.Load(urn)
+	contract.Assertf(has, "cannot complete a resource '%v' whose registration isn't pending", urn)
+	contract.Assertf(step != nil, "expected a non-nil resource step ('%v')", urn)
+	ex.pendingNews.Delete(urn)
+	reg := step.(Step)
+
+	// Unconditionally set the resource's outputs to what was provided.  This intentionally overwrites whatever
+	// might already be there, since otherwise "deleting" outputs would have no affect.
+	outs := e.Outputs()
+	logging.V(7).Infof("Registered resource outputs %s: old=#%d, new=#%d", urn, len(reg.New().Outputs), len(outs))
+	reg.New().Outputs = e.Outputs()
+
+	// If there is an event subscription for finishing the resource, execute them.
+	if ex.events != nil {
+		if eventerr := ex.events.OnResourceOutputs(reg); eventerr != nil {
+			return errors.Wrapf(eventerr, "resource complete event returned an error")
 		}
 	}
 
-	logging.V(planExecutorLogLevel).Infof("PlanExecutor.Execute(...): exited event loop, waiting for completion")
-	pe.stepExec.WaitForCompletion()
-	logging.V(planExecutorLogLevel).Infof("PlanExecutor.Execute(...): step executor has completed")
-
-	// To provide the best error message we can, we've kept track of whether or not we were successful and, if we
-	// were not, if we failed because of a cancel or because the step executor died.
-	if pe.canceled() {
-		logging.V(planExecutorLogLevel).Infof("PlanExecutor.Execute(...): observed that the plan was canceled")
-		return ErrCanceled
-	}
-
-	if pe.errored() {
-		logging.V(planExecutorLogLevel).Infof("PlanExecutor.Execute(...): observed that the plan errored")
-		if pe.preview {
-			return ErrPreviewFailed
-		}
-
-		return ErrUpdateFailed
-	}
-
-	logging.V(planExecutorLogLevel).Infof("PlanExecutor.Execute(...): observed that the plan was successful")
+	// Finally, let the language provider know that we're done processing the event.
+	e.Done()
 	return nil
 }
 
-// Summary returns a PlanSummary of the plan that was executed.
-func (pe *PlanExecutor) Summary() PlanSummary {
-	return pe.stepGen
-}
-
-// errored returns whether or not this plan failed due to an error in step application.
-func (pe *PlanExecutor) errored() bool {
-	return pe.sawError.Load().(bool) || pe.stepExec.Errored()
-}
-
-// canceled returns whether or not this plan failed because it was canceled through Ctrl-C.
-func (pe *PlanExecutor) canceled() bool {
-	return pe.sawCancel.Load().(bool)
-}
-
-// cancelDueToError cancels the step executor and signals shutdown because the plan executor witnessed
-// an error that the step executor would not have witnessed. The main reason this happens is because of errors
-// occurring in the source program that can't be translated into chains for the step executor to execute.
-func (pe *PlanExecutor) cancelDueToError() {
-	pe.sawError.Store(true)
-	pe.stepExecCancel.Cancel()
-}
-
-// handleSingleEvent handles a single source event. For all incoming events, it produces a chain that needs
-// to be executed and schedules the chain for execution.
-func (pe *PlanExecutor) handleSingleEvent(event SourceEvent) {
-	if event == nil {
-		logging.V(planExecutorLogLevel).Infof("PlanExecutor.handleSingleEvent(...): received nil event")
-		return
+// drive iterates the given SourceIterator, calculates indepentently-executable step chains, and sends each chain down
+// the provided channel for execution.
+func (ex *planExecutor) drive(src SourceIterator, stepGen *stepGenerator, chains chan<- []Step) error {
+	// Iterate the source in a separate goroutine so that we don't get stuck in src.Next during cancellation.
+	type sourceEvent struct {
+		event SourceEvent
+		err   error
 	}
+	events := make(chan sourceEvent)
+	go func() {
+		for {
+			// If the execution has been cancelled, just return.
+			if ex.canceled() {
+				return
+			}
 
-	logging.V(planExecutorLogLevel).Infof("PlanExecutor.handleSingleEvent(...): received event")
-	switch e := event.(type) {
-	case RegisterResourceEvent:
-		step, steperr := pe.stepGen.GenerateSteps(e)
-		if steperr != nil {
-			logging.V(planExecutorLogLevel).Infof(
-				"PlanExecutor.handleSingleEvent(...): received step event error: %v", steperr.Error())
-			pe.stepExecCancel.Cancel()
-			return
+			// Otherwise, fetch the next step from the source iterator and send it down the event channel.
+			event, err := src.Next()
+			select {
+			case events <- sourceEvent{event: event, err: err}:
+				if event == nil || err != nil {
+					close(events)
+					return
+				}
+			case <-ex.context.Done():
+				return
+			}
+		}
+	}()
+
+	// Iterate the event channel and generate step chains that can be executed in parallel.
+	for {
+		var sev sourceEvent
+		select {
+		case sev = <-events:
+		case <-ex.context.Done():
+			return nil
+		}
+		// If there was an error, return it; if there was no event, we're done.
+		if sev.err != nil {
+			return sev.err
+		}
+		if sev.event == nil {
+			break
 		}
 
-		logging.V(planExecutorLogLevel).Infof("PlanExecutor.handleSingleEvent(...): submitting chain for execution")
-		pe.stepExec.Execute(step)
-	case RegisterResourceOutputsEvent:
-		logging.V(planExecutorLogLevel).Infof("PlanExecutor.handleSingleEvent(...): received register resource outputs")
-		pe.stepExec.ExecuteRegisterResourceOutputs(e)
+		// If we have an event, drive the behavior based on which kind it is.
+		switch e := sev.event.(type) {
+		case RegisterResourceEvent:
+			// If the intent is to register a resource, compute the plan steps necessary to do so.
+			steps, steperr := stepGen.GenerateSteps(e)
+			if steperr != nil {
+				return steperr
+			}
+			select {
+			case chains <- steps:
+			case <-ex.context.Done():
+				return nil
+			}
+		case RegisterResourceOutputsEvent:
+			// If the intent is to complete a prior resource registration, do so. We do this by just
+			// processing the request from the existing state, and do not expose our callers to it.
+			if err := ex.registerResourceOutputs(e); err != nil {
+				return err
+			}
+		default:
+			contract.Failf("Unrecognized intent from source iterator: %T", e)
+		}
 	}
+
+	// Create and drain a delete graph.
+	deletes := newDeleteGraph(stepGen.GenerateDeletes())
+	for deletes.Len() > 0 {
+		// Peel off the latest set of leaves.
+		steps := deletes.pruneLeaves()
+		contract.Assert(len(steps) > 0)
+
+		// Create a wait group and a completion notifier.
+		wg, done := &sync.WaitGroup{}, make(chan bool)
+		wg.Add(len(steps))
+		go func() {
+			wg.Wait()
+			close(done)
+		}()
+
+		// Fire off each step in turn.
+		for _, s := range steps {
+			s.wg = wg
+			select {
+			case chains <- []Step{s}:
+			case <-ex.context.Done():
+				return nil
+			}
+		}
+
+		// Wait for the deletes to finish before going around again.
+		select {
+		case <-done:
+		case <-ex.context.Done():
+			return nil
+		}
+	}
+
+	return nil
 }
 
-// NewPlanExecutor creates a new PlanExecutor suitable for executing the given plan.
-func NewPlanExecutor(ctx *cancel.Context, plan *Plan, opts Options, preview bool, src SourceIterator) *PlanExecutor {
-	_, execCancel := cancel.NewContext(context.Background())
-	pe := &PlanExecutor{
-		plan:           plan,
-		opts:           opts,
-		src:            src,
-		preview:        preview,
-		stepGen:        newStepGenerator(plan, opts),
-		stepExec:       newStepExecutor(execCancel, plan, opts, preview),
-		ctx:            ctx,
-		stepExecCancel: execCancel,
+// Execute executes the given plan according to the supplied options. If parallel execution is enabled, it uses a pool
+// of workers to execute steps concurrently.
+func (p *Plan) Execute(ctx context.Context, opts Options, preview bool) (PlanSummary, error) {
+	// Create a step generator.
+	stepGen := newStepGenerator(p, opts)
+
+	// Obtain a source iterator.
+	src, err := p.Source().Iterate(opts)
+	if err != nil {
+		return stepGen, err
+	}
+	defer contract.IgnoreClose(src)
+
+	// Set up our executor.
+	chains := make(chan []Step)
+	pexContext, cancel := context.WithCancel(ctx)
+	pex := &planExecutor{
+		context: pexContext,
+		preview: preview,
+		events: opts.Events,
+		pendingNews: &sync.Map{},
 	}
 
-	pe.sawError.Store(false)
-	pe.sawCancel.Store(false)
-	return pe
+	// Set up the wait group we'll use to track our workers.
+	fanout := opts.DegreeOfParallelism()
+	wg := &sync.WaitGroup{}
+	wg.Add(fanout)
+
+	// Start our workers.
+	logging.V(7).Infof("plan.Execute is starting %v workers...", fanout)
+	errors := make([]error, fanout)
+	for i := 0; i < fanout; i++ {
+		go func(idx int) {
+			if err := pex.worker(idx, chains); err != nil {
+				errors[idx] = err
+				contract.IgnoreClose(src)
+				cancel()
+			}
+			logging.V(7).Infof("worker[%v].finished(%v)", idx, errors[idx])
+			wg.Done()
+		}(i)
+	}
+
+	// Run the driver.
+	if err = pex.drive(src, stepGen, chains); err != nil {
+		cancel()
+		return stepGen, err
+	}
+	close(chains)
+
+	// Wait for the workers to finish, then accumulate any errors and return.
+	wg.Wait()
+	for _, e := range errors {
+		if e != nil {
+			err = multierror.Append(err, e)
+		}
+	}
+	return stepGen, err
 }

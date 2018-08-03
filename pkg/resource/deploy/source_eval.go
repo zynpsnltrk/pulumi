@@ -242,8 +242,13 @@ func (rm *resmon) Address() string {
 
 // Cancel signals that the engine should be terminated, awaits its termination, and returns any errors that result.
 func (rm *resmon) Cancel() error {
-	close(rm.cancel)
-	return <-rm.done
+	select {
+	case <-rm.cancel:
+		return nil
+	default:
+		close(rm.cancel)
+		return <-rm.done
+	}
 }
 
 // Invoke performs an invocation of a member located in a resource provider.
@@ -368,6 +373,7 @@ func (rm *resmon) RegisterResource(ctx context.Context,
 	step := &registerResourceEvent{
 		goal: resource.NewGoal(t, name, custom, props, parent, protect, dependencies),
 		done: make(chan *RegisterResult),
+		cancel: rm.cancel,
 	}
 
 	select {
@@ -435,6 +441,7 @@ func (rm *resmon) RegisterResourceOutputs(ctx context.Context,
 		urn:     urn,
 		outputs: outs,
 		done:    make(chan bool),
+		cancel: rm.cancel,
 	}
 
 	select {
@@ -460,6 +467,7 @@ func (rm *resmon) RegisterResourceOutputs(ctx context.Context,
 type registerResourceEvent struct {
 	goal *resource.Goal       // the resource goal state produced by the iterator.
 	done chan *RegisterResult // the channel to communicate with after the resource state is available.
+	cancel <-chan bool
 }
 
 var _ RegisterResourceEvent = (*registerResourceEvent)(nil)
@@ -472,13 +480,17 @@ func (g *registerResourceEvent) Goal() *resource.Goal {
 
 func (g *registerResourceEvent) Done(result *RegisterResult) {
 	// Communicate the resulting state back to the RPC thread, which is parked awaiting our reply.
-	g.done <- result
+	select {
+	case g.done <- result:
+	case <-g.cancel:
+	}
 }
 
 type registerResourceOutputsEvent struct {
 	urn     resource.URN         // the URN to which this completion applies.
 	outputs resource.PropertyMap // an optional property bag for output properties.
 	done    chan bool            // the channel to communicate with after the operation completes.
+	cancel <-chan bool
 }
 
 var _ RegisterResourceOutputsEvent = (*registerResourceOutputsEvent)(nil)
@@ -495,5 +507,8 @@ func (g *registerResourceOutputsEvent) Outputs() resource.PropertyMap {
 
 func (g *registerResourceOutputsEvent) Done() {
 	// Communicate the resulting state back to the RPC thread, which is parked awaiting our reply.
-	g.done <- true
+	select {
+	case g.done <- true:
+	case <-g.cancel:
+	}
 }

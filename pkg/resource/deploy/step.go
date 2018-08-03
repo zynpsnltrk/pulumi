@@ -15,6 +15,8 @@
 package deploy
 
 import (
+	"sync"
+
 	"github.com/pkg/errors"
 
 	"github.com/pulumi/pulumi/pkg/diag/colors"
@@ -196,6 +198,7 @@ type DeleteStep struct {
 	plan      *Plan           // the current plan.
 	old       *resource.State // the state of the existing resource.
 	replacing bool            // true if part of a replacement.
+	wg        *sync.WaitGroup // the wait group for this delete, if any
 }
 
 var _ Step = (*DeleteStep)(nil)
@@ -255,6 +258,10 @@ func (s *DeleteStep) Apply(preview bool) (resource.Status, error) {
 				return rst, err
 			}
 		}
+	}
+
+	if s.wg != nil {
+		s.wg.Done()
 	}
 
 	return resource.StatusOK, nil

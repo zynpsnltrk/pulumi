@@ -15,6 +15,7 @@
 package engine
 
 import (
+	"context"
 	"os"
 	"sync"
 
@@ -190,17 +191,13 @@ func (res *planResult) Walk(ctx *Context, events deploy.Events, preview bool) (d
 		Parallel: res.Options.Parallel,
 	}
 
-	src, err := res.Plan.Source().Iterate(opts)
-	if err != nil {
-		return nil, err
-	}
-
+	// Execute the plan.
+	execContext, cancelExec := context.WithCancel(context.Background())
 	done := make(chan bool)
 	var summary deploy.PlanSummary
+	var err error
 	go func() {
-		planExec := deploy.NewPlanExecutor(ctx.Cancel, res.Plan, opts, preview, src)
-		err = planExec.Execute()
-		summary = planExec.Summary()
+		summary, err = res.Plan.Execute(execContext, opts, preview)
 		close(done)
 	}()
 
@@ -208,6 +205,8 @@ func (res *planResult) Walk(ctx *Context, events deploy.Events, preview bool) (d
 	go func() {
 		select {
 		case <-ctx.Cancel.Canceled():
+			cancelExec()
+
 			cancelErr := res.Plan.SignalCancellation()
 			if cancelErr != nil {
 				glog.V(3).Infof("Attempted to signal cancellation to resource providers, but failed: %s",
@@ -223,6 +222,7 @@ func (res *planResult) Walk(ctx *Context, events deploy.Events, preview bool) (d
 		return summary, ctx.Cancel.TerminateErr()
 
 	case <-done:
+		glog.V(7).Infof("exec err: %v", err)
 		return summary, err
 	}
 }
