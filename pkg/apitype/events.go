@@ -18,13 +18,8 @@ package apitype
 // package. The duplication is intentional to insulate the Pulumi service from various kinds of
 // breaking changes.
 //
-// Unlike Checkpoint, Deployment, and Resource, these types will never be "round tripped" from
-// the Pulumi service. So no special need for being able to upgrade older shapes of engine events
-// to newer ones is necessary. Rather, engine events are converted to the types defined here and
-// sent to the service, allowing for safe drift between the two.
-//
-// However, we do need to maintain a stable type for use in the Pulumi REST API. (See core.go for
-// details on how to avoid unintentional breaking changes.)
+// The types aren't versioned in the same manner as Resource, Deployment, and Checkpoint (see
+// apitype/migrate). So care must be taken if these were ever returned from the service to the CLI.
 
 // CancelEvent is emitted when the user initiates a cancellation of the update in progress, or
 // the update successfully completes.

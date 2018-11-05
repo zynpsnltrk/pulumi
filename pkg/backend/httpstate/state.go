@@ -149,17 +149,16 @@ func (u *cloudUpdate) recordEvent(
 		return err
 	}
 
-	// Convert the engine event into a more structured format the Pulumi service expects.
-	convertedEvent, conversionErr := convertEngineEvent(event)
-	if conversionErr != nil {
-		return errors.Wrap(conversionErr, "converting engine event")
+	// Send the event to the Pulumi Service to power things like the update summary page.
+	apiEvent, convErr := convertEngineEvent(event)
+	if convErr != nil {
+		return errors.Wrap(convErr, "converting engine event")
 	}
-	if err := u.backend.client.RecordEngineEvent(u.context, u.update, convertedEvent, token); err != nil {
+	if err := u.backend.client.RecordEngineEvent(u.context, u.update, apiEvent, token); err != nil {
 		return err
 	}
 
-	// The following is an older codepath where we pre-rendered the event using the diff view, and then reported
-	// the result to the service. Useful, but failed to capture more detailed information.
+	// We also pre-render the event using the DiffView and post as applicable.
 	fields := make(map[string]interface{})
 	kind := string(apitype.StdoutEvent)
 	if event.Type == engine.DiagEvent {
@@ -400,7 +399,7 @@ func convertEngineEvent(e engine.Event) (apitype.EngineEvent, error) {
 		// Convert the config bag.
 		cfg := make(map[string]string)
 		for k, v := range p.Config {
-			cfg[string(k)] = v
+			cfg[k] = v
 		}
 		apiEvent.PreludeEvent = &apitype.PreludeEvent{
 			Config: cfg,
@@ -450,7 +449,7 @@ func convertEngineEvent(e engine.Event) (apitype.EngineEvent, error) {
 		apiEvent.ResOpFailedEvent = &apitype.ResOpFailedEvent{
 			Metadata: convertStepEventMetadata(p.Metadata),
 			Status:   int(p.Status),
-			Steps:    int(p.Steps),
+			Steps:    p.Steps,
 		}
 
 	default:
